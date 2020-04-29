@@ -5,6 +5,7 @@ from eth_utils import big_endian_to_int, humanize_hash, int_to_big_endian
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Column,
     ForeignKey,
     Index,
@@ -60,6 +61,12 @@ class Header(Base):
     query = Session.query_property()
 
     __tablename__ = "header"
+    __table_args__ = (
+        CheckConstraint(
+            "_parent_hash is null or _detatched_parent_hash is null",
+            name="_no_double_parent_hash",
+        ),
+    )
 
     hash = Column(LargeBinary(32), primary_key=True)
 
@@ -70,6 +77,7 @@ class Header(Base):
 
     is_canonical = Column(Boolean, nullable=False)
 
+    _detatched_parent_hash = Column(LargeBinary(32), nullable=True, index=True)
     _parent_hash = Column(
         LargeBinary(32), ForeignKey("header.hash"), nullable=True, index=True
     )
@@ -94,7 +102,11 @@ class Header(Base):
 
     @property
     def parent_hash(self) -> Optional[Hash32]:
-        if self._parent_hash is None:
+        if self._parent_hash is not None and self._detatched_parent_hash is not None:
+            raise TypeError("Invalid: header has two parent hashes")
+        elif self._detatched_parent_hash is not None:
+            return self._detatched_parent_hash
+        elif self._parent_hash is None:
             if self.block_number == 0:
                 return GENESIS_PARENT_HASH
             else:

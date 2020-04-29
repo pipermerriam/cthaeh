@@ -1,9 +1,13 @@
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from cthaeh.constants import GENESIS_PARENT_HASH
 from cthaeh.models import Block, Header, Log, Receipt, Topic, Transaction
 from cthaeh.tools.factories import (
     BlockFactory,
     BlockTransactionFactory,
     BlockUncleFactory,
+    Hash32Factory,
     HeaderFactory,
     LogFactory,
     LogTopicFactory,
@@ -274,7 +278,7 @@ def test_orm_simple_header(session):
 
 
 def test_orm_genesis_header(session):
-    header = HeaderFactory(_parent_hash=None)
+    header = HeaderFactory(parent_hash=None)
 
     with session.begin_nested():
         session.add(header)
@@ -283,3 +287,26 @@ def test_orm_genesis_header(session):
 
     assert header_from_db.hash == header.hash
     assert header_from_db.parent_hash == GENESIS_PARENT_HASH
+
+
+def test_orm_detatched_header(session):
+    parent_hash = Hash32Factory()
+    header = HeaderFactory(parent_hash=None, detatched_parent_hash=parent_hash)
+
+    with session.begin_nested():
+        session.add(header)
+
+    header_from_db = session.query(Header).filter(Header.hash == header.hash).one()
+
+    assert header_from_db.hash == header.hash
+    assert header_from_db.parent_hash == parent_hash
+
+
+def test_orm_header_invalid_with_multiple_parent_hashes(session):
+    parent_hash_a = Hash32Factory()
+    parent_hash_b = Hash32Factory()
+    header = HeaderFactory(parent_hash=parent_hash_a, detatched_parent_hash=parent_hash_b)
+
+    with pytest.raises(IntegrityError):
+        with session.begin_nested():
+            session.add(header)
