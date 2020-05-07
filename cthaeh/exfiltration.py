@@ -295,6 +295,8 @@ class HeadExfiltrator(Service):
                         for sub_err in err.exceptions
                     ):
                         continue
+                    else:
+                        raise
                 except TransactionNotFound:
                     continue
 

@@ -69,6 +69,11 @@ class Header(Base):
             name="_no_double_parent_hash",
         ),
         Index("ix_hash_is_canonical", "hash", "is_canonical"),
+        Index(
+            "ix_parent_hash_detatched_parent_hash",
+            "_parent_hash",
+            "_detatched_parent_hash",
+        ),
     )
 
     hash = Column(LargeBinary(32), primary_key=True)

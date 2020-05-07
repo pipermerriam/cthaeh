@@ -31,8 +31,8 @@ from cthaeh.models import (
     Receipt,
     Topic,
     Transaction,
-    query_row_count,
 )
+from cthaeh.session import Session
 
 logger = logging.getLogger("cthaeh.import")
 
@@ -142,11 +142,12 @@ def get_or_create_blockuncles(
 
 
 def import_block(
-    session: orm.Session,
     block_ir: BlockIR,
     cache: LRU[Hash32, None],
     is_detatched: bool = False,
 ) -> None:
+    session = Session()
+
     with session.begin_nested():
         # TODO: Things that need to be cleaned up here.
         # 1. get_or_create_uncles and get_or_create_transactions end up doing one
@@ -162,9 +163,10 @@ def import_block(
                 .one()
             )
         except NoResultFound:
-            header = Header.from_ir(block_ir.header, is_detatched=is_detatched)
-            block = Block(header_hash=header.hash)
-            session.add_all((header, block))  # type: ignore
+            with session.begin_nested():
+                header = Header.from_ir(block_ir.header, is_detatched=is_detatched)
+                block = Block(header_hash=header.hash)
+                session.add_all((header, block))  # type: ignore
         else:
             header.is_canonical = block_ir.header.is_canonical
             block = header.block
@@ -187,8 +189,8 @@ def import_block(
         )
 
         receipts = tuple(
-            Receipt.from_ir(receipt_ir, Hash32(transaction_ir.hash))
-            for transaction_ir, receipt_ir in zip(
+            Receipt.from_ir(receipt_ir, Hash32(transaction.hash))
+            for transaction, receipt_ir in zip(
                 block_ir.transactions, block_ir.receipts
             )
         )
@@ -236,8 +238,12 @@ def import_block(
         )
         session.add_all(objects_to_save)  # type: ignore
 
+    session.commit()  # type: ignore
 
-def orphan_header_chain(session: orm.Session, orphans: Sequence[HeaderIR]) -> None:
+
+def orphan_header_chain(orphans: Sequence[HeaderIR]) -> None:
+    session = Session()
+
     with session.begin_nested():
         header_hashes = set(header_ir.hash for header_ir in orphans)
 
@@ -271,34 +277,25 @@ def orphan_header_chain(session: orm.Session, orphans: Sequence[HeaderIR]) -> No
         if not transactions:
             logger.debug("No orphaned transactions to unlink....")
 
-        for transaction in transactions:
-            logger.debug(
-                "Unlinking txn: %s from block %s",
-                humanize_hash(transaction.hash),
-                humanize_hash(transaction.block_header_hash),
-            )
-            transaction.block_header_hash = None
+        transaction_hashes = set(transaction.hash for transaction in transactions)
 
-            if transaction.receipt is not None:
-                for log_idx, log in enumerate(transaction.receipt.logs):
-                    logger.debug("Deleting log #%d", log_idx)
-                    for logtopic in log.logtopics:
-                        logger.debug(
-                            "Deleting logtopic #%d: %s",
-                            logtopic.idx,
-                            humanize_hash(logtopic.topic_topic),
-                        )
-                        with session.begin_nested():
-                            session.delete(logtopic)  # type: ignore
-                    with session.begin_nested():
-                        session.delete(log)  # type: ignore
-                logger.debug(
-                    "Deleting txn receipt: %s", humanize_hash(transaction.hash)
-                )
-                with session.begin_nested():
-                    session.delete(transaction.receipt)  # type: ignore
-            else:
-                logger.debug("Txn %s already has null receipt")
+        session.query(Transaction).filter(
+            Transaction.hash.in_(transaction_hashes),
+        ).update({'block_header_hash': None}, synchronize_session=False)
+
+        session.query(LogTopic).filter(
+            LogTopic.log_receipt_hash.in_(transaction_hashes),
+        ).delete(synchronize_session=False)
+
+        session.query(Log).filter(
+            Log.receipt_hash.in_(transaction_hashes),
+        ).delete(synchronize_session=False)
+
+        session.query(Receipt).filter(
+            Receipt.transaction_hash.in_(transaction_hashes),
+        ).delete(synchronize_session=False)
+
+    session.commit()  # type: ignore
 
 
 class HeadLoader(Service):
@@ -310,35 +307,30 @@ class HeadLoader(Service):
         block_receive_channel: trio.abc.ReceiveChannel[HeadBlockPacket],
     ) -> None:
         self._block_receive_channel = block_receive_channel
-        self._session = session
         self._topic_cache: LRU[Hash32, None] = LRU(100_000)
 
-    async def _handle_head_packet(
+    def _handle_head_packet(
         self, packet: HeadBlockPacket, is_detatched: bool = False
     ) -> None:
         self.logger.debug(
             "Importing new HEAD #%d", packet.blocks[0].header.block_number
         )
-        with self._session.begin_nested():
-            if packet.orphans:
-                self.logger.info(
-                    "Reorg orphaned %d blocks starting at %s",
-                    len(packet.orphans),
-                    packet.orphans[0],
-                )
-                orphan_header_chain(self._session, packet.orphans)
-
-            import_block(
-                self._session,
-                packet.blocks[0],
-                self._topic_cache,
-                is_detatched=is_detatched,
+        if packet.orphans:
+            self.logger.info(
+                "Reorg orphaned %d blocks starting at %s",
+                len(packet.orphans),
+                packet.orphans[0],
             )
+            orphan_header_chain(packet.orphans)
 
-            for block_ir in packet.blocks[1:]:
-                import_block(self._session, block_ir, self._topic_cache)
+        import_block(
+            packet.blocks[0],
+            self._topic_cache,
+            is_detatched=is_detatched,
+        )
 
-        self._session.commit()  # type: ignore
+        for block_ir in packet.blocks[1:]:
+            import_block(block_ir, self._topic_cache)
 
         self.logger.info("New chain HEAD: #%s", packet.blocks[-1].header)
 
@@ -348,8 +340,9 @@ class HeadLoader(Service):
         async with self._block_receive_channel:
             first_packet = await self._block_receive_channel.receive()
             if first_packet.blocks[0].header.block_number > 0:
+                session = Session()
                 is_detatched = (
-                    self._session.query(Header)  # type: ignore
+                    session.query(Header)  # type: ignore
                     .filter(Header.hash == first_packet.blocks[0].header.parent_hash)
                     .scalar()
                     is None
@@ -357,10 +350,17 @@ class HeadLoader(Service):
             else:
                 is_detatched = False
 
-            await self._handle_head_packet(first_packet, is_detatched=is_detatched)
+            await trio.to_thread.run_sync(
+                self._handle_head_packet,
+                first_packet,
+                is_detatched,
+            )
 
             async for packet in self._block_receive_channel:
-                await self._handle_head_packet(packet)
+                await trio.to_thread.run_sync(
+                    self._handle_head_packet,
+                    packet,
+                )
 
 
 def find_first_missing_block_number(session: orm.Session) -> BlockNumber:
@@ -414,14 +414,15 @@ class HistoryFiller(Service):
         end_height: BlockNumber,
     ) -> None:
         self._w3 = w3
-        self._session = session
         self._start_height = start_height
         self._end_height = end_height
         self._concurrency_factor = concurrency
 
     async def run(self) -> None:
+        session = Session()
+
         while True:
-            start_height = find_first_missing_block_number(self._session)
+            start_height = find_first_missing_block_number(session)
             if self._start_height is not None and start_height < self._start_height:
                 is_detatched = True
                 start_height = self._start_height
@@ -435,7 +436,7 @@ class HistoryFiller(Service):
             try:
                 end_height = min(
                     self._end_height,
-                    find_first_detatched_block_after(self._session, start_height),
+                    find_first_detatched_block_after(session, start_height),
                 )
             except NoGapFound:
                 end_height = self._end_height
@@ -452,7 +453,6 @@ class HistoryFiller(Service):
                 concurrency_factor=self._concurrency_factor,
             )
             loader = HistoryLoader(
-                session=self._session,
                 block_receive_channel=receive_channel,
                 is_detatched=is_detatched,
             )
@@ -483,7 +483,7 @@ class HistoryFiller(Service):
             # TODO: connect disconnected head to the new present head
             try:
                 detatched_header = (
-                    self._session.query(Header)  # type: ignore
+                    session.query(Header)  # type: ignore
                     .filter(
                         Header.is_canonical.is_(True),  # type: ignore
                         Header.block_number == end_height,
@@ -495,7 +495,7 @@ class HistoryFiller(Service):
                 self.manager.cancel()
                 break
 
-            with self._session.begin_nested():
+            with session.begin_nested():
                 detatched_header._parent_hash = detatched_header._detatched_parent_hash
                 detatched_header._detatched_parent_hash = None
                 self.logger.info(
@@ -503,7 +503,7 @@ class HistoryFiller(Service):
                     detatched_header.block_number,
                     humanize_hash(detatched_header.hash),
                 )
-                self._session.add(detatched_header)
+                session.add(detatched_header)
 
 
 class HistoryLoader(Service):
@@ -513,25 +513,21 @@ class HistoryLoader(Service):
 
     def __init__(
         self,
-        session: orm.Session,
         block_receive_channel: trio.abc.ReceiveChannel[BlockIR],
         is_detatched: bool,
     ) -> None:
         self._block_receive_channel = block_receive_channel
-        self._session = session
         self._is_detatched = is_detatched
         # TODO: use a shared cache
         self._topic_cache: LRU[Hash32, None] = LRU(100_000)
 
-    async def _handle_import_block(
+    def _handle_import_block(
         self, block_ir: BlockIR, is_detatched: bool = False
     ) -> None:
         self.logger.debug("Importing block #%d", block_ir.header.block_number)
-        with self._session.begin_nested():
-            import_block(
-                self._session, block_ir, self._topic_cache, is_detatched=is_detatched
-            )
-        self._session.commit()  # type: ignore
+        import_block(
+            block_ir, self._topic_cache, is_detatched=is_detatched
+        )
         self._last_loaded_block = block_ir
 
         self.logger.debug("Imported block #%d", block_ir.header.block_number)
@@ -543,12 +539,17 @@ class HistoryLoader(Service):
 
         async with self._block_receive_channel:
             first_block_ir = await self._block_receive_channel.receive()
-            await self._handle_import_block(
-                first_block_ir, is_detatched=self._is_detatched
+            await trio.to_thread.run_sync(
+                self._handle_import_block,
+                first_block_ir,
+                self._is_detatched,
             )
 
             async for block_ir in self._block_receive_channel:
-                await self._handle_import_block(block_ir)
+                await trio.to_thread.run_sync(
+                    self._handle_import_block,
+                    block_ir,
+                )
 
         self.manager.cancel()
 
@@ -579,9 +580,14 @@ class HistoryLoader(Service):
                     continue
 
                 num_imported = last_loaded_height - last_reported_height
-                total_rows = query_row_count(
-                    self._session, last_reported_height, last_loaded_height
-                )
+                total_rows = 0
+                # This query is really slow and expensive so disabled for now....
+                # total_rows = await trio.to_thread.run_sync(
+                #     query_row_count,
+                #     self._session,
+                #     last_reported_height,
+                #     last_loaded_height,
+                # )
                 duration = time.monotonic() - last_reported_at
                 blocks_per_second = num_imported / duration
                 items_per_second = total_rows / duration
