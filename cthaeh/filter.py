@@ -91,30 +91,14 @@ def filter_logs(session: orm.Session, params: FilterParams) -> Tuple[Log, ...]:
 
     query = (
         session.query(Log)  # type: ignore
-        .join(Receipt, Log.receipt_hash == Receipt.transaction_hash)
-        .join(Transaction, Receipt.transaction_hash == Transaction.hash)
-        .join(Block, Transaction.block_header_hash == Block.header_hash)
-        .join(Header, Block.header_hash == Header.hash)
+        .join(Receipt, Receipt.logs)
+        .join(Transaction, Transaction.canonical_receipt)
+        .join(Block, Block.transactions)
+        .join(Header, Header.block)
         .outerjoin(logtopic_0, Log.logtopics)
         .outerjoin(logtopic_1, Log.logtopics)
         .outerjoin(logtopic_2, Log.logtopics)
         .outerjoin(logtopic_3, Log.logtopics)
-        # .outerjoin(
-        #     logtopic_0,
-        #     and_(Log.idx == logtopic_0.log_idx, Log.receipt_hash == logtopic_0.log_receipt_hash),
-        # )
-        # .outerjoin(
-        #     logtopic_1,
-        #     and_(Log.idx == logtopic_1.log_idx, Log.receipt_hash == logtopic_1.log_receipt_hash),
-        # )
-        # .outerjoin(
-        #     logtopic_2,
-        #     and_(Log.idx == logtopic_2.log_idx, Log.receipt_hash == logtopic_2.log_receipt_hash),
-        # )
-        # .outerjoin(
-        #     logtopic_3,
-        #     and_(Log.idx == logtopic_3.log_idx, Log.receipt_hash == logtopic_3.log_receipt_hash),
-        # )
         .filter(*orm_filters)
     )
 

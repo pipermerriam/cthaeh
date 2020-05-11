@@ -118,9 +118,10 @@ def construct_log(
         log_topics = tuple(
             LogTopic(
                 idx=idx,
-                log_idx=log.idx,
-                log_receipt_hash=log.receipt.transaction.hash,
                 topic_topic=topic,
+                log_idx=log.idx,
+                log_transaction_hash=log.receipt.transaction_hash,
+                log_block_header_hash=log.receipt.block_header_hash,
             )
             for idx, topic in enumerate(topics)
         )

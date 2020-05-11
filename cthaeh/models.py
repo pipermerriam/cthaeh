@@ -46,6 +46,7 @@ class BlockUncle(Base):
             "uncle_hash",
             unique=True,
         ),
+        CheckConstraint("idx >= 0", name="_idx_positive"),
     )
 
     idx = Column(Integer, nullable=False)
@@ -68,6 +69,11 @@ class Header(Base):
             "_parent_hash is null or _detatched_parent_hash is null",
             name="_no_double_parent_hash",
         ),
+        CheckConstraint("block_number >= 0", name="_block_number_positive"),
+        CheckConstraint("gas_limit >= 0", name="_gas_limit_positive"),
+        CheckConstraint("gas_used >= 0", name="_gas_used_positive"),
+        CheckConstraint("difficulty >= 0", name="_difficulty_positive"),
+        CheckConstraint("timestamp >= 0", name="_timestamp_positive"),
         Index("ix_hash_is_canonical", "hash", "is_canonical"),
         Index(
             "ix_parent_hash_detatched_parent_hash",
@@ -194,6 +200,7 @@ class BlockTransaction(Base):
             "transaction_hash",
             unique=True,
         ),
+        CheckConstraint("idx >= 0", name="_idx_positive"),
     )
     idx = Column(Integer, nullable=False)
 
@@ -204,8 +211,13 @@ class BlockTransaction(Base):
         LargeBinary(32), ForeignKey("transaction.hash"), primary_key=True
     )
 
-    block = relationship("Block")
-    transaction = relationship("Transaction")
+    block = relationship("Block", back_populates="blocktransactions")
+    transaction = relationship("Transaction", back_populates="blocktransactions")
+    receipt = relationship(
+        "Receipt",
+        back_populates="blocktransaction",
+        foreign_keys="(Receipt.transaction_hash, Receipt.block_header_hash)",
+    )
 
 
 class Block(Base):
@@ -221,11 +233,31 @@ class Block(Base):
         "Transaction", secondary="blocktransaction", order_by=BlockTransaction.idx
     )
 
+    blocktransactions = relationship("BlockTransaction")
+    receipts = relationship(
+        "Receipt",
+        secondary="blocktransaction",
+        order_by=BlockTransaction.idx,
+        foreign_keys="(Receipt.transaction_hash, Receipt.block_header_hash)",
+        primaryjoin=(
+            "and_("
+            "Receipt.transaction_hash == BlockTransaction.transaction_hash, "
+            "Receipt.block_header_hash == BlockTransaction.block_header_hash, "
+            "BlockTransaction.block_header_hash == Block.header_hash, "
+            ")"
+        ),
+    )
+
 
 class Transaction(Base):
     query = Session.query_property()
 
     __tablename__ = "transaction"
+    __table_args__ = (
+        CheckConstraint("gas >= 0", name="_gas_positive"),
+        CheckConstraint("gas_limit >= 0", name="_gas_limit_positive"),
+        CheckConstraint("nonce >= 0", name="_nonce_positive"),
+    )
 
     hash = Column(LargeBinary(32), primary_key=True)
 
@@ -237,8 +269,34 @@ class Transaction(Base):
     blocks = relationship(
         "Block", secondary="blocktransaction", order_by=BlockTransaction.idx
     )
-    receipt = relationship(
-        "Receipt", uselist=False, back_populates="transaction", cascade="all"
+    blocktransactions = relationship("BlockTransaction", back_populates="transaction")
+
+    canonical_receipt = relationship(
+        "Receipt",
+        uselist=False,
+        secondary="blocktransaction",
+        back_populates="transaction",
+        foreign_keys="(Receipt.transaction_hash, Receipt.block_header_hash)",
+        primaryjoin=(
+            "and_("
+            "Receipt.transaction_hash == BlockTransaction.transaction_hash, "
+            "Receipt.block_header_hash == BlockTransaction.block_header_hash, "
+            "BlockTransaction.transaction_hash == Transaction.hash, "
+            "BlockTransaction.block_header_hash == Transaction.block_header_hash, "
+            ")"
+        ),
+    )
+    receipts = relationship(
+        "Receipt",
+        secondary="blocktransaction",
+        back_populates="transaction",
+        foreign_keys="Receipt.transaction_hash",
+        primaryjoin=(
+            "and_("
+            "Receipt.transaction_hash == BlockTransaction.transaction_hash, "
+            "BlockTransaction.transaction_hash == Transaction.hash, "
+            ")"
+        ),
     )
 
     nonce = Column(BigInteger, nullable=False)
@@ -277,19 +335,58 @@ class Receipt(Base):
     query = Session.query_property()
 
     __tablename__ = "receipt"
+    __table_args__ = (
+        ForeignKeyConstraint(
+            ("transaction_hash", "block_header_hash"),
+            ("blocktransaction.transaction_hash", "blocktransaction.block_header_hash"),
+        ),
+        UniqueConstraint(
+            "transaction_hash",
+            "block_header_hash",
+            name="uix_transaction_hash_block_header_hash",
+        ),
+        CheckConstraint("gas_used >= 0", name="_gas_used_positive"),
+    )
     __mapper_args__ = {"confirm_deleted_rows": False}
 
     transaction_hash = Column(
-        LargeBinary(32), ForeignKey("transaction.hash"), primary_key=True
+        LargeBinary(32),
+        ForeignKey("blocktransaction.transaction_hash"),
+        primary_key=True,
+        index=True,
     )
-    transaction = relationship("Transaction", back_populates="receipt")
+    block_header_hash = Column(
+        LargeBinary(32),
+        ForeignKey("blocktransaction.block_header_hash"),
+        primary_key=True,
+        index=True,
+    )
+    blocktransaction = relationship(
+        "BlockTransaction",
+        back_populates="receipt",
+        foreign_keys=(transaction_hash, block_header_hash),
+    )
+
+    transaction = relationship(
+        "Transaction",
+        uselist=False,
+        secondary="blocktransaction",
+        back_populates="receipts",
+        primaryjoin=and_(
+            Transaction.hash == BlockTransaction.transaction_hash,
+            BlockTransaction.transaction_hash == transaction_hash,
+            BlockTransaction.block_header_hash == block_header_hash,
+        ),
+    )
+    logs = relationship(
+        "Log",
+        foreign_keys="(Log.transaction_hash, Log.block_header_hash)",
+        order_by="Log.idx",
+    )
 
     state_root = Column(LargeBinary(32), nullable=False)
     gas_used = Column(BigInteger, nullable=False)
     _bloom = Column(LargeBinary(1024), nullable=False)
-    logs = relationship(
-        "Log", back_populates="receipt", order_by="Log.idx", cascade="all"
-    )
 
     @property
     def bloom(self) -> int:
@@ -315,33 +412,45 @@ class LogTopic(Base):
     __tablename__ = "logtopic"
     __table_args__ = (
         UniqueConstraint(
-            "idx", "log_receipt_hash", "log_idx", name="ix_idx_log_receipt_hash_log_idx"
+            "idx",
+            "log_idx",
+            "log_transaction_hash",
+            "log_block_header_hash",
+            name="ix_idx_log_idx_log_transaction_hash_log_block_header_hash",
         ),
         Index(
-            "ix_idx_topic_topic_log_receipt_hash_log_idx",
+            "ix_idx_topic_topic_log_idx_log_transaction_hash_log_block_header_hash",
             "idx",
             "topic_topic",
-            "log_receipt_hash",
             "log_idx",
+            "log_transaction_hash",
+            "log_block_header_hash",
         ),
         ForeignKeyConstraint(
-            ("log_idx", "log_receipt_hash"), ("log.idx", "log.receipt_hash")
+            ("log_idx", "log_transaction_hash", "log_block_header_hash"),
+            ("log.idx", "log.transaction_hash", "log.block_header_hash"),
         ),
+        CheckConstraint("idx >= 0 AND idx <= 3", name="_limit_4_topics_per_log"),
     )
     __mapper_args__ = {"confirm_deleted_rows": False}
 
-    id = Column(Integer, primary_key=True)
-
-    idx = Column(Integer, nullable=False)
+    idx = Column(Integer, nullable=False, primary_key=True)
 
     topic_topic = Column(
         LargeBinary(32), ForeignKey("topic.topic"), index=True, nullable=False
     )
-    log_idx = Column(Integer, nullable=False)
-    log_receipt_hash = Column(LargeBinary(32), nullable=False)
+    log_idx = Column(Integer, nullable=False, primary_key=True)
+    log_transaction_hash = Column(
+        LargeBinary(32), nullable=False, index=True, primary_key=True
+    )
+    log_block_header_hash = Column(
+        LargeBinary(32), nullable=False, index=True, primary_key=True
+    )
 
     topic = relationship("Topic")
-    log = relationship("Log", foreign_keys=[log_idx, log_receipt_hash])
+    log = relationship(
+        "Log", foreign_keys=[log_idx, log_transaction_hash, log_block_header_hash]
+    )
 
 
 class Log(Base):
@@ -349,20 +458,40 @@ class Log(Base):
 
     __tablename__ = "log"
     __table_args__ = (
-        UniqueConstraint("idx", "receipt_hash", name="ix_idx_receipt_hash"),
+        UniqueConstraint(
+            "idx",
+            "transaction_hash",
+            "block_header_hash",
+            name="uix_idx_transaction_hash_block_header_hash",
+        ),
+        ForeignKeyConstraint(
+            ("transaction_hash", "block_header_hash"),
+            ("receipt.transaction_hash", "receipt.block_header_hash"),
+        ),
+        CheckConstraint("idx >= 0", name="_idx_positive"),
     )
     __mapper_args__ = {"confirm_deleted_rows": False}
 
-    # composite primary key
+    # composite primary key across `idx`, `transaction_hash`, and`block_header_hash`
     idx = Column(Integer, primary_key=True, index=True)
-    receipt_hash = Column(
+    transaction_hash = Column(
         LargeBinary(32),
         ForeignKey("receipt.transaction_hash"),
         primary_key=True,
         index=True,
     )
+    block_header_hash = Column(
+        LargeBinary(32),
+        ForeignKey("receipt.block_header_hash"),
+        primary_key=True,
+        index=True,
+    )
 
-    receipt = relationship("Receipt", back_populates="logs")
+    receipt = relationship(
+        "Receipt",
+        back_populates="logs",
+        foreign_keys=(transaction_hash, block_header_hash),
+    )
 
     address = Column(LargeBinary(20), index=True, nullable=False)
     topics = relationship(
@@ -370,12 +499,18 @@ class Log(Base):
         secondary="logtopic",
         order_by=LogTopic.idx,
         primaryjoin=and_(
-            LogTopic.log_idx == idx, LogTopic.log_receipt_hash == receipt_hash
+            LogTopic.log_idx == idx,
+            LogTopic.log_transaction_hash == transaction_hash,
+            LogTopic.log_block_header_hash == block_header_hash,
         ),
     )
     logtopics = relationship(
         "LogTopic",
-        foreign_keys=(LogTopic.log_idx, LogTopic.log_receipt_hash),
+        foreign_keys=(
+            LogTopic.log_idx,
+            LogTopic.log_transaction_hash,
+            LogTopic.log_block_header_hash,
+        ),
         cascade="all",
     )
     data = Column(LargeBinary, nullable=False)
@@ -384,7 +519,7 @@ class Log(Base):
         return (
             f"Log("
             f"idx={self.idx!r}, "
-            f"receipt_hash={self.receipt_hash!r}, "
+            f"transaction_hash={self.transaction_hash!r}, "
             f"address={self.address!r}, "
             f"data={self.data!r}, "
             f"topics={self.topics!r}"
@@ -411,9 +546,19 @@ class Log(Base):
         return f"Log[#{self.idx} A={humanize_hash(self.address)} D={pretty_data}/T={pretty_topics}]"  # type: ignore  # noqa: E501
 
     @classmethod
-    def from_ir(cls, log_ir: LogIR, idx: int, receipt_hash: Hash32) -> "Log":
+    def from_ir(
+        cls,
+        log_ir: LogIR,
+        idx: int,
+        transaction_hash: Hash32,
+        block_header_hash: Hash32,
+    ) -> "Log":
         return cls(
-            idx=idx, receipt_hash=receipt_hash, address=log_ir.address, data=log_ir.data
+            idx=idx,
+            transaction_hash=transaction_hash,
+            block_header_hash=block_header_hash,
+            address=log_ir.address,
+            data=log_ir.data,
         )
 
 
@@ -427,10 +572,11 @@ class Topic(Base):
     logs = relationship(
         "Log",
         secondary="logtopic",
-        order_by=LogTopic.idx,
         primaryjoin=(LogTopic.topic_topic == topic),
         secondaryjoin=and_(
-            LogTopic.log_idx == Log.idx, LogTopic.log_receipt_hash == Log.receipt_hash
+            LogTopic.log_idx == Log.idx,
+            LogTopic.log_transaction_hash == Log.transaction_hash,
+            LogTopic.log_block_header_hash == Log.block_header_hash,
         ),
     )
 
@@ -465,7 +611,11 @@ def query_row_count(session: orm.Session, start_at: int, end_at: int) -> int:
     )
 
     num_logs = (
-        Log.query.join(Receipt, Log.receipt_hash == Receipt.transaction_hash)
+        Log.query.join(
+            Receipt,
+            Log.transaction_hash == Receipt.transaction_hash,
+            Log.block_header_hash == Receipt.block_header_hash,
+        )
         .join(Transaction, Receipt.transaction_hash == Transaction.hash)
         .join(Block, Transaction.block_header_hash == Block.header_hash)
         .join(Header, Block.header_hash == Header.hash)

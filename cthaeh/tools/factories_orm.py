@@ -59,6 +59,14 @@ class HeaderFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
     # mix_hash = factory.LazyFunction(Hash32Factory)
     nonce = factory.LazyFunction(lambda: secrets.token_bytes(8))
 
+    @classmethod
+    def from_parent(cls, parent: Header) -> Header:
+        return cls(
+            parent_hash=parent.hash,
+            detatched_parent_hash=None,
+            block_number=parent.block_number + 1,
+        )
+
 
 class BlockFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
     class Meta:
@@ -73,8 +81,13 @@ class BlockUncleFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
         model = BlockUncle
         sqlalchemy_session = Session
 
+    idx = 0
+
     block = factory.SubFactory(BlockFactory)
+    block_header_hash = factory.LazyAttribute(lambda obj: obj.block.header_hash)
+
     uncle = factory.SubFactory(HeaderFactory)
+    uncle_hash = factory.LazyAttribute(lambda obj: obj.uncle.hash)
 
 
 class TransactionFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
@@ -84,8 +97,6 @@ class TransactionFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignor
 
     # TODO: Compute via RLP
     hash = factory.LazyFunction(Hash32Factory)
-
-    block = factory.SubFactory(BlockFactory)
 
     nonce = 0
     gas_price = 1
@@ -105,6 +116,8 @@ class BlockTransactionFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: 
         model = BlockTransaction
         sqlalchemy_session = Session
 
+    idx = 0
+
     block = factory.SubFactory(BlockFactory)
     transaction = factory.SubFactory(TransactionFactory)
 
@@ -115,7 +128,13 @@ class ReceiptFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
         sqlalchemy_session = Session
         rename = {"bloom": "_bloom"}
 
-    transaction = factory.SubFactory(TransactionFactory)
+    blocktransaction = factory.SubFactory(BlockTransactionFactory)
+    transaction_hash = factory.LazyAttribute(
+        lambda obj: obj.blocktransaction.transaction_hash
+    )
+    block_header_hash = factory.LazyAttribute(
+        lambda obj: obj.blocktransaction.block_header_hash
+    )
 
     state_root = factory.LazyFunction(Hash32Factory)
     bloom = b""
@@ -129,6 +148,8 @@ class LogFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
 
     idx = 0
     receipt = factory.SubFactory(ReceiptFactory)
+    transaction_hash = factory.LazyAttribute(lambda obj: obj.receipt.transaction_hash)
+    block_header_hash = factory.LazyAttribute(lambda obj: obj.receipt.block_header_hash)
 
     address = factory.LazyFunction(AddressFactory)
     data = b""
@@ -150,3 +171,9 @@ class LogTopicFactory(factory.alchemy.SQLAlchemyModelFactory):  # type: ignore
     idx = 0
 
     topic = factory.SubFactory(TopicFactory)
+    topic_topic = factory.LazyAttribute(lambda obj: obj.topic.topic)
+
+    log = factory.SubFactory(LogFactory)
+    log_idx = factory.LazyAttribute(lambda obj: obj.log.idx)
+    log_transaction_hash = factory.LazyAttribute(lambda obj: obj.log.transaction_hash)
+    log_block_header_hash = factory.LazyAttribute(lambda obj: obj.log.block_header_hash)
